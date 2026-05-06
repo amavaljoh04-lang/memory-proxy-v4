@@ -60,6 +60,11 @@ async def lifespan(app: FastAPI):
         memory = MemoryStore(encoder)
         stats = memory.stats()
         total = sum(stats.values()) if isinstance(stats, dict) else 0
+        # Restore active project from Qdrant
+        saved_project = memory.load_setting("active_project")
+        if saved_project:
+            conv_projects["_global"] = saved_project
+            log.info(f"Restored active project: {saved_project}")
         log.info(f"Ready — {total} memories across {len(stats)} collections")
     except Exception as e:
         log.error(f"Failed to init encoder/memory: {e}")
@@ -134,7 +139,10 @@ def execute_slash_command(cmd: dict, model: str, conv_id: str) -> dict:
     if action == "switch_project":
         proj = cmd["project"]
         conv_projects[conv_id] = proj
+        conv_projects["_global"] = proj  # global default for new conversations
         register_project(proj)
+        if memory:
+            memory.save_setting("active_project", proj)
         stats = memory.stats() if memory else {}
         count = stats.get(proj, 0)
         text = f"Projet actif : **{proj.upper()}**\nMémoires dans ce projet : {count}"
@@ -148,6 +156,7 @@ def execute_slash_command(cmd: dict, model: str, conv_id: str) -> dict:
         total = sum(v for v in stats_before.values() if isinstance(v, int))
         if memory:
             memory.clear_all()
+            memory.save_setting("active_project", "general")
         conv_projects.clear()
         text = f"Toute la mémoire a été effacée ({total} souvenirs supprimés)."
 
@@ -451,7 +460,7 @@ async def chat(request: Request):
             break
 
     # Check for /slash commands — intercept before Ollama
-    current = conv_projects.get(conv_id, "general")
+    current = conv_projects.get(conv_id, conv_projects.get("_global", "general"))
     slash_cmd = detect_slash_command(user_query, current)
     if slash_cmd:
         model = body.get("model", "unknown")
@@ -546,7 +555,7 @@ async def chat_completions(request: Request):
             break
 
     # Check for /slash commands
-    current = conv_projects.get(conv_id, "general")
+    current = conv_projects.get(conv_id, conv_projects.get("_global", "general"))
     slash_cmd = detect_slash_command(user_query, current)
     if slash_cmd:
         log.info(f"Slash command (OpenAI): {slash_cmd['action']} [conv={conv_id}]")
@@ -746,7 +755,7 @@ async def project_debug(conv_id: str):
     """Debug project detection for a specific conversation."""
     return {
         "conv_id": conv_id,
-        "current_project": conv_projects.get(conv_id, "general"),
+        "current_project": conv_projects.get(conv_id, conv_projects.get("_global", "general")),
         "recurring_names": get_conv_name_stats(conv_id),
     }
 

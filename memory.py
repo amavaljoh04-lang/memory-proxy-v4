@@ -454,3 +454,65 @@ class MemoryStore:
                 print(f"[Memory] Migration error for {old_col}: {e}")
         
         return migrated
+
+    # ─── Settings persistence (active project, etc.) ───
+
+    SETTINGS_COLLECTION = "mem_settings"
+
+    def _ensure_settings(self):
+        """Create settings collection if needed (no vector, payload only)."""
+        try:
+            collections = [c.name for c in self.client.get_collections().collections]
+            if self.SETTINGS_COLLECTION not in collections:
+                self.client.create_collection(
+                    collection_name=self.SETTINGS_COLLECTION,
+                    vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+                )
+                self.client.create_payload_index(
+                    collection_name=self.SETTINGS_COLLECTION,
+                    field_name="key",
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                )
+                print(f"[Memory] Created settings collection")
+        except Exception as e:
+            print(f"[Memory] Error ensuring settings: {e}")
+
+    def save_setting(self, key: str, value: str):
+        """Save a key-value setting in Qdrant (upsert by key)."""
+        self._ensure_settings()
+        try:
+            # Delete existing entries with this key
+            self.client.delete(
+                collection_name=self.SETTINGS_COLLECTION,
+                points_selector=Filter(
+                    must=[FieldCondition(key="key", match=MatchValue(value=key))]
+                ),
+            )
+            # Insert new
+            dummy_vec = [0.0] * EMBED_DIM
+            point = PointStruct(
+                id=str(uuid.uuid4()),
+                vector=dummy_vec,
+                payload={"key": key, "value": value, "timestamp": time.time()},
+            )
+            self.client.upsert(collection_name=self.SETTINGS_COLLECTION, points=[point])
+        except Exception as e:
+            print(f"[Memory] Error saving setting {key}: {e}")
+
+    def load_setting(self, key: str) -> Optional[str]:
+        """Load a setting value from Qdrant. Returns None if not found."""
+        self._ensure_settings()
+        try:
+            results, _ = self.client.scroll(
+                collection_name=self.SETTINGS_COLLECTION,
+                scroll_filter=Filter(
+                    must=[FieldCondition(key="key", match=MatchValue(value=key))]
+                ),
+                limit=1,
+                with_payload=True,
+            )
+            if results:
+                return results[0].payload.get("value")
+        except Exception as e:
+            print(f"[Memory] Error loading setting {key}: {e}")
+        return None
