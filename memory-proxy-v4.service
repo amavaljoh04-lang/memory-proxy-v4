@@ -1,0 +1,18 @@
+[Unit]
+Description=Memory Proxy v4 - Simple Ollama Memory Layer
+After=network.target
+
+[Service]
+Type=simple
+User=aque
+WorkingDirectory=/home/aque/memory-proxy-v4
+Environment=OLLAMA_URL=http://localhost:11434
+Environment=QDRANT_HOST=localhost
+Environment=QDRANT_PORT=6333
+ExecStartPre=-/usr/bin/fuser -k 5556/tcp
+ExecStart=/usr/bin/python3 server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

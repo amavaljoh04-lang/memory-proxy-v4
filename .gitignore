@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pt
+*.bin
+*.model
+*.json.bak
+*.log
+*.tar.gz
+.env
+nohup.out
