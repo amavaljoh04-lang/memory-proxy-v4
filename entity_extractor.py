@@ -45,6 +45,9 @@ PATTERNS: list[tuple[str, str, float]] = [
     # IPs
     (r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?\b', "ip", 0.85),
     
+    # Constants (UPPER_CASE = value) — high importance
+    (r'\b[A-Z][A-Z0-9_]{2,}\s*=\s*[^\n]{1,80}', "constant", 0.90),
+    
     # Variables / parameters (key=value)
     (r'\b[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*[\d.e\-+]+(?:\s*[A-Z]+)?', "variable", 0.80),
     
