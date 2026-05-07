@@ -48,6 +48,9 @@ memory: MemoryStore = None
 
 # Track active project per conversation
 conv_projects: dict[str, str] = {}  # conv_id -> project
+# Track manually-set projects (via /projet X) — immune to auto-detection override
+manual_projects: set[str] = set()  # set of conv_ids with manual override
+_global_manual: bool = False  # True if /projet X was used (global sticky)
 
 
 @asynccontextmanager
@@ -65,6 +68,11 @@ async def lifespan(app: FastAPI):
         if saved_project:
             conv_projects["_global"] = saved_project
             log.info(f"Restored active project: {saved_project}")
+        # Restore manual lock flag
+        saved_manual = memory.load_setting("manual_project_lock")
+        if saved_manual == "true":
+            _global_manual = True
+            log.info("Restored manual project lock — auto-detect disabled")
         log.info(f"Ready — {total} memories across {len(stats)} collections")
     except Exception as e:
         log.error(f"Failed to init encoder/memory: {e}")
@@ -133,6 +141,7 @@ def detect_slash_command(text: str, current_project: str = "general") -> dict | 
 
 def execute_slash_command(cmd: dict, model: str, conv_id: str) -> dict:
     """Execute a slash command and return an Ollama-format response."""
+    global _global_manual
     action = cmd["action"]
     text = ""
 
@@ -140,12 +149,15 @@ def execute_slash_command(cmd: dict, model: str, conv_id: str) -> dict:
         proj = cmd["project"]
         conv_projects[conv_id] = proj
         conv_projects["_global"] = proj  # global default for new conversations
+        manual_projects.add(conv_id)
+        _global_manual = True  # all new convs inherit manual override
         register_project(proj)
         if memory:
             memory.save_setting("active_project", proj)
+            memory.save_setting("manual_project_lock", "true")
         stats = memory.stats() if memory else {}
         count = stats.get(proj, 0)
-        text = f"Projet actif : **{proj.upper()}**\nMémoires dans ce projet : {count}"
+        text = f"Projet actif : **{proj.upper()}** (verrouillé — la détection auto ne changera pas ce projet)\nMémoires dans ce projet : {count}"
 
     elif action == "show_project":
         proj = cmd.get("project", "general")
@@ -157,8 +169,11 @@ def execute_slash_command(cmd: dict, model: str, conv_id: str) -> dict:
         if memory:
             memory.clear_all()
             memory.save_setting("active_project", "general")
+            memory.save_setting("manual_project_lock", "false")
         conv_projects.clear()
-        text = f"Toute la mémoire a été effacée ({total} souvenirs supprimés)."
+        manual_projects.clear()
+        _global_manual = False
+        text = f"Toute la mémoire a été effacée ({total} souvenirs supprimés).\nLe verrouillage projet est désactivé — la détection auto est réactivée."
 
     elif action == "clear_project":
         proj = cmd["project"]
@@ -468,8 +483,13 @@ async def chat(request: Request):
         result = execute_slash_command(slash_cmd, model, conv_id)
         return JSONResponse(result)
 
-    # Detect project
-    project = detect_project(messages, current, conv_id=conv_id)
+    # Detect project — but NEVER override a manual /projet X
+    is_manual = conv_id in manual_projects or _global_manual
+    if is_manual:
+        project = current
+        log.info(f"Using manual project: {project} [conv={conv_id}] (auto-detect skipped)")
+    else:
+        project = detect_project(messages, current, conv_id=conv_id)
     conv_projects[conv_id] = project
 
     # Inject memories (skip for meta-messages)
@@ -573,8 +593,13 @@ async def chat_completions(request: Request):
         }
         return JSONResponse(openai_result)
 
-    # Detect project
-    project = detect_project(messages, current, conv_id=conv_id)
+    # Detect project — but NEVER override a manual /projet X
+    is_manual = conv_id in manual_projects or _global_manual
+    if is_manual:
+        project = current
+        log.info(f"Using manual project: {project} [conv={conv_id}] (auto-detect skipped)")
+    else:
+        project = detect_project(messages, current, conv_id=conv_id)
     conv_projects[conv_id] = project
 
     if user_query and memory and not is_meta_message(user_query):
