@@ -4,12 +4,15 @@ Architecture:
 - Each project gets its own collection: "mem_{project}"
 - "mem_general" for non-project-specific memories
 - "mem_entities" for extracted entities (shared across projects, tagged)
+- Hybrid recall: vector similarity + keyword boost
 - Time-decay: newer memories score higher
 - Auto-cleanup: cap per collection (default 5000)
 """
+import re
 import uuid
 import time
 import math
+import logging
 from typing import Optional
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -25,7 +28,78 @@ from config import (
 from encoder import Encoder
 from chunker import Chunk
 
+log = logging.getLogger("memory")
+
 ENTITY_COLLECTION = "mem_entities"
+
+# Stopwords for keyword extraction (FR + EN)
+_STOPWORDS = {
+    "le", "la", "les", "de", "du", "des", "un", "une", "et", "ou", "en", "au",
+    "aux", "ce", "ces", "que", "qui", "quoi", "dans", "par", "pour", "avec",
+    "sur", "est", "sont", "a", "ont", "je", "tu", "il", "elle", "nous", "vous",
+    "ils", "se", "me", "te", "ne", "pas", "mon", "ma", "mes", "ton", "ta",
+    "son", "sa", "ses", "notre", "votre", "leur", "quel", "quelle", "quels",
+    "comment", "est-ce", "c'est", "the", "a", "an", "is", "are", "was", "were",
+    "be", "been", "being", "have", "has", "had", "do", "does", "did", "will",
+    "would", "could", "should", "may", "might", "can", "shall", "of", "to",
+    "in", "for", "on", "with", "at", "by", "from", "as", "into", "about",
+    "it", "its", "my", "your", "his", "her", "our", "their", "this", "that",
+    "what", "which", "who", "whom", "where", "when", "how", "why", "i", "you",
+    "he", "she", "we", "they", "me", "him", "us", "them",
+}
+
+# Semantic equivalences (query term → memory term matches)
+_SYNONYMS = {
+    "habite": {"vis", "habite", "belgique", "france", "pays", "ville", "adresse", "domicile", "réside", "localisation"},
+    "appelle": {"appelle", "nom", "prénom", "name", "identity"},
+    "travaille": {"travaille", "projet", "project", "boulot", "job", "embedding", "training", "entraînement"},
+    "carte": {"carte", "gpu", "graphique", "rtx", "gtx", "nvidia", "vram", "cuda"},
+    "budget": {"budget", "million", "euros", "dollars", "financement", "coût", "investisseur"},
+    "couleur": {"couleur", "color", "#", "hex", "rgb", "bleu", "rouge", "vert", "jaune"},
+    "modèle": {"modèle", "model", "ia", "ai", "llm", "embedding"},
+}
+
+
+def _extract_keywords(query: str) -> set[str]:
+    """Extract meaningful keywords from a query for hybrid matching."""
+    words = re.findall(r"[a-zA-ZÀ-ÿ0-9#_./-]{2,}", query.lower())
+    keywords = {w for w in words if w not in _STOPWORDS}
+    # Add synonym expansions
+    expanded = set(keywords)
+    for kw in keywords:
+        for key, synonyms in _SYNONYMS.items():
+            if kw == key or kw in synonyms:
+                expanded.update(synonyms)
+    return expanded
+
+
+def _keyword_boost(text: str, keywords: set[str]) -> float:
+    """Compute keyword boost for a memory text. Returns 1.0 (no boost) to 1.5."""
+    if not keywords:
+        return 1.0
+    text_lower = text.lower()
+    matches = sum(1 for kw in keywords if kw in text_lower)
+    if matches == 0:
+        return 1.0
+    ratio = matches / len(keywords)
+    # Boost: 1.0 (0 matches) → 1.5 (all keywords match)
+    return 1.0 + (ratio * 0.5)
+
+
+# Sensitive patterns to filter out before storage
+_SENSITIVE_PATTERNS = [
+    re.compile(r'(?:api[_-]?key|secret[_-]?key|password|passwd|token|auth[_-]?token)\s*[:=]\s*["\']?[\w\-./+]{8,}', re.IGNORECASE),
+    re.compile(r'(?:sk|pk|ak|rk)-[a-zA-Z0-9]{20,}'),  # API keys like sk-xxx
+    re.compile(r'(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}'),  # GitHub tokens
+    re.compile(r'Bearer\s+[A-Za-z0-9\-._~+/]+=*', re.IGNORECASE),  # Bearer tokens
+]
+
+
+def sanitize_text(text: str) -> str:
+    """Remove sensitive data (API keys, passwords, tokens) before storage."""
+    for pattern in _SENSITIVE_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return text
 
 
 class MemoryStore:
@@ -78,10 +152,11 @@ class MemoryStore:
 
         points = []
         for chunk in chunks:
-            embedding = self.encoder.encode(chunk.text)
+            clean_text = sanitize_text(chunk.text)
+            embedding = self.encoder.encode(clean_text)
             point_id = str(uuid.uuid4())
             payload = {
-                "text": chunk.text,
+                "text": clean_text,
                 "speaker": chunk.speaker,
                 "chunk_idx": chunk.chunk_idx,
                 "conv_id": chunk.metadata.get("conv_id", ""),
@@ -106,13 +181,15 @@ class MemoryStore:
 
         points = []
         for ent in entities:
-            text = ent.to_chunk_text()
+            text = sanitize_text(ent.to_chunk_text())
+            if "[REDACTED]" in text:
+                continue  # Skip entirely redacted entities
             embedding = self.encoder.encode(text)
             point_id = str(uuid.uuid4())
             payload = {
                 "text": text,
                 "entity_type": ent.entity_type,
-                "entity_value": ent.value,
+                "entity_value": sanitize_text(ent.value),
                 "context": ent.context,
                 "importance": ent.importance,
                 "project": project,
@@ -129,41 +206,39 @@ class MemoryStore:
     def recall(self, query: str, project: str = "general",
                top_k: int = MAX_MEMORIES_INJECT,
                exclude_conv_id: Optional[str] = None) -> list[dict]:
-        """Recall from project collection + entities, with time-decay.
+        """Recall from ALL collections with hybrid scoring (vector + keyword).
         
-        When project is "general", searches ALL collections to find anything relevant.
-        When project is specific, searches that project + general + entities.
+        Always searches all mem_* collections so personal info (name, location)
+        stored in any project is always findable. Active project results get a
+        small score boost for relevance. Keyword matches boost the vector score.
         """
         query_emb = self.encoder.encode(query)
         now = time.time()
+        keywords = _extract_keywords(query)
 
         all_results = []
+        active_col = self._collection_name(project) if project != "general" else None
 
-        if project == "general":
-            # No specific project → search ALL collections
-            try:
-                collections = [c.name for c in self.client.get_collections().collections]
-                for col in collections:
-                    if col.startswith("mem_") and col != ENTITY_COLLECTION:
-                        hits = self._search(col, query_emb, top_k * 2, exclude_conv_id)
-                        all_results.extend(hits)
-            except Exception:
-                pass
-        else:
-            # Specific project → search project + general
-            col = self._collection_name(project)
-            self._ensure_collection(col)
-            hits = self._search(col, query_emb, top_k * 3, exclude_conv_id)
-            all_results.extend(hits)
+        # Search ALL mem_* collections
+        try:
+            collections = [c.name for c in self.client.get_collections().collections]
+            for col in collections:
+                if not col.startswith("mem_") or col in (ENTITY_COLLECTION, "mem_settings"):
+                    continue
+                hits = self._search(col, query_emb, top_k * 2, exclude_conv_id)
+                # Boost results from active project
+                if active_col and col == active_col:
+                    for h in hits:
+                        h["score"] = min(h["score"] * 1.15, 1.0)
+                all_results.extend(hits)
+        except Exception as e:
+            log.error(f"Recall collection scan error: {e}")
 
-            gen_hits = self._search("mem_general", query_emb, top_k, exclude_conv_id)
-            all_results.extend(gen_hits)
-
-        # Always search entities
-        entity_hits = self._search_entities(query_emb, project, top_k)
+        # Always search entities (no project filter — search all)
+        entity_hits = self._search_entities(query_emb, None, top_k)
         all_results.extend(entity_hits)
 
-        # Apply time-decay and deduplicate
+        # Apply time-decay, keyword boost, and deduplicate
         scored = []
         seen_texts = set()
         for hit in all_results:
@@ -175,7 +250,11 @@ class MemoryStore:
             # Time-decay: newer memories get a boost
             age_hours = (now - hit.get("timestamp", now)) / 3600
             decay = self._time_decay(age_hours)
-            final_score = hit["score"] * decay
+            
+            # Keyword boost: if query keywords appear in the memory text
+            kw_boost = _keyword_boost(text, keywords)
+            
+            final_score = hit["score"] * decay * kw_boost
 
             if final_score >= MIN_SCORE:
                 hit["score"] = round(final_score, 4)
@@ -228,10 +307,10 @@ class MemoryStore:
             })
         return hits
 
-    def _search_entities(self, query_emb: list, project: str, limit: int) -> list[dict]:
-        """Search entities. When general, search all; otherwise filter by project."""
+    def _search_entities(self, query_emb: list, project: Optional[str], limit: int) -> list[dict]:
+        """Search entities. When None or general, search all; otherwise filter by project."""
         search_filter = None
-        if project != "general":
+        if project and project != "general":
             search_filter = Filter(
                 should=[
                     FieldCondition(key="project", match=MatchValue(value=project)),
@@ -454,6 +533,88 @@ class MemoryStore:
                 print(f"[Memory] Migration error for {old_col}: {e}")
         
         return migrated
+
+    # ─── Memory Compression / Summarization ───
+
+    def compress_old_memories(self, collection: str, max_age_hours: float = 168,
+                              max_per_group: int = 3) -> dict:
+        """Compress memories older than max_age_hours by grouping similar ones.
+        
+        Groups old memories by similarity, keeps the best representative from each
+        group, and removes duplicates. Returns stats about what was compressed.
+        """
+        try:
+            info = self.client.get_collection(collection)
+            if info.points_count < 50:
+                return {"skipped": "too few memories"}
+            
+            cutoff = time.time() - (max_age_hours * 3600)
+            
+            # Get old memories
+            old_points, _ = self.client.scroll(
+                collection_name=collection,
+                scroll_filter=Filter(
+                    must=[FieldCondition(
+                        key="timestamp",
+                        range=models.Range(lt=cutoff)
+                    )]
+                ),
+                limit=500,
+                with_payload=True,
+                with_vectors=True,
+            )
+            
+            if len(old_points) < 10:
+                return {"skipped": "few old memories", "count": len(old_points)}
+            
+            # Simple dedup: group by text similarity (exact prefix match for now)
+            groups = {}
+            for p in old_points:
+                text = p.payload.get("text", "")
+                key = text[:50].lower().strip()
+                if key not in groups:
+                    groups[key] = []
+                groups[key].append(p)
+            
+            to_delete = []
+            kept = 0
+            for key, points in groups.items():
+                if len(points) <= 1:
+                    kept += 1
+                    continue
+                # Keep the newest, delete the rest
+                points.sort(key=lambda p: p.payload.get("timestamp", 0), reverse=True)
+                kept += 1
+                for p in points[1:]:
+                    to_delete.append(p.id)
+            
+            if to_delete:
+                self.client.delete(
+                    collection_name=collection,
+                    points_selector=models.PointIdsList(points=to_delete)
+                )
+            
+            return {
+                "collection": collection,
+                "old_memories": len(old_points),
+                "groups": len(groups),
+                "deleted_duplicates": len(to_delete),
+                "kept": kept,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def compress_all(self, max_age_hours: float = 168) -> dict:
+        """Compress all project collections."""
+        results = {}
+        try:
+            collections = [c.name for c in self.client.get_collections().collections]
+            for col in collections:
+                if col.startswith("mem_") and col not in (ENTITY_COLLECTION, "mem_settings"):
+                    results[col] = self.compress_old_memories(col, max_age_hours)
+        except Exception as e:
+            results["error"] = str(e)
+        return results
 
     # ─── Settings persistence (active project, etc.) ───
 

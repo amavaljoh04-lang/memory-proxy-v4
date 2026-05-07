@@ -21,8 +21,8 @@ MAX_SEQ_LEN = 256
 EMBED_DIM = 768
 
 # Memory settings
-MAX_MEMORIES_INJECT = 5       # Max memories injected per request
-MIN_SCORE = 0.12              # Min score after time-decay (low = more recall)
+MAX_MEMORIES_INJECT = 8       # Max memories injected per request
+MIN_SCORE = 0.10              # Min score after time-decay (low = more recall)
 CHUNK_MAX_TOKENS = 100        # Max tokens per chunk
 CHUNK_OVERLAP = 20            # Token overlap between chunks
 MAX_MEMORIES_PER_COLLECTION = 5000  # Auto-cleanup when exceeded

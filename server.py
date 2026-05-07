@@ -473,9 +473,13 @@ async def chat(request: Request):
     conv_projects[conv_id] = project
 
     # Inject memories (skip for meta-messages)
-    if user_query and memory and not is_meta_message(user_query):
+    is_meta = is_meta_message(user_query) if user_query else True
+    if user_query and memory and not is_meta:
+        log.info(f"Recall for: '{user_query[:60]}' [project={project}, conv={conv_id}]")
         messages = inject_memories(messages, user_query, conv_id, project)
         body["messages"] = messages
+    elif is_meta:
+        log.debug(f"Skipped meta message: {user_query[:40]}")
 
     if stream:
         return await _stream_chat(body, messages, user_query, conv_id, project)
@@ -774,6 +778,174 @@ async def memory_migrate(request: Request):
     collections = body.get("collections", ["memory_v4", "episodic"])
     result = memory.migrate_legacy(collections, project_detector=detect_from_text_strict)
     return {"status": "migrated", "results": result}
+
+
+# ─── Memory Visualization ───
+
+@app.get("/memory/timeline")
+async def memory_timeline(project: str = None, limit: int = 50):
+    """Get a chronological timeline of memories, optionally filtered by project."""
+    if not memory:
+        return JSONResponse({"error": "Memory not initialized"}, status_code=503)
+    try:
+        from qdrant_client.models import OrderBy
+        results = []
+        collections = [c.name for c in memory.client.get_collections().collections]
+        
+        for col in collections:
+            if not col.startswith("mem_") or col in ("mem_entities", "mem_settings"):
+                continue
+            proj_name = col.replace("mem_", "")
+            if project and proj_name != project.lower():
+                continue
+            try:
+                points, _ = memory.client.scroll(
+                    collection_name=col, limit=limit,
+                    with_payload=True, with_vectors=False
+                )
+                for p in points:
+                    results.append({
+                        "text": p.payload.get("text", "")[:200],
+                        "speaker": p.payload.get("speaker", ""),
+                        "project": proj_name,
+                        "timestamp": p.payload.get("timestamp", 0),
+                        "type": "memory",
+                    })
+            except Exception:
+                pass
+        
+        results.sort(key=lambda x: x["timestamp"], reverse=True)
+        return {"timeline": results[:limit], "total": len(results)}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/memory/graph")
+async def memory_graph():
+    """Get a graph representation of entities and their relationships."""
+    if not memory:
+        return JSONResponse({"error": "Memory not initialized"}, status_code=503)
+    try:
+        nodes = []
+        edges = []
+        entity_by_type = {}
+        
+        points, _ = memory.client.scroll(
+            collection_name="mem_entities", limit=200,
+            with_payload=True, with_vectors=False
+        )
+        
+        for p in points:
+            etype = p.payload.get("entity_type", "unknown")
+            value = p.payload.get("entity_value", "")[:60]
+            proj = p.payload.get("project", "general")
+            
+            node_id = f"{etype}:{value}"
+            if node_id not in entity_by_type:
+                entity_by_type[node_id] = True
+                nodes.append({
+                    "id": node_id,
+                    "label": value,
+                    "type": etype,
+                    "project": proj,
+                    "importance": p.payload.get("importance", 0.5),
+                })
+                # Edge: entity → project
+                edges.append({
+                    "source": node_id,
+                    "target": f"project:{proj}",
+                    "relation": "belongs_to",
+                })
+        
+        # Add project nodes
+        collections = [c.name for c in memory.client.get_collections().collections]
+        for col in collections:
+            if col.startswith("mem_") and col not in ("mem_entities", "mem_settings"):
+                proj_name = col.replace("mem_", "")
+                info = memory.client.get_collection(col)
+                nodes.append({
+                    "id": f"project:{proj_name}",
+                    "label": proj_name.upper(),
+                    "type": "project",
+                    "memories": info.points_count,
+                })
+        
+        return {"nodes": nodes, "edges": edges}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/memory/entity_types")
+async def entity_types():
+    """Get summary of entities grouped by type."""
+    if not memory:
+        return JSONResponse({"error": "Memory not initialized"}, status_code=503)
+    try:
+        from collections import Counter
+        type_counts = Counter()
+        type_examples = {}
+        
+        points, _ = memory.client.scroll(
+            collection_name="mem_entities", limit=500,
+            with_payload=True, with_vectors=False
+        )
+        
+        for p in points:
+            etype = p.payload.get("entity_type", "unknown")
+            value = p.payload.get("entity_value", "")[:60]
+            type_counts[etype] += 1
+            if etype not in type_examples:
+                type_examples[etype] = []
+            if len(type_examples[etype]) < 3:
+                type_examples[etype].append(value)
+        
+        return {
+            "entity_types": {
+                etype: {"count": count, "examples": type_examples.get(etype, [])}
+                for etype, count in type_counts.most_common()
+            }
+        }
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/memory/compress")
+async def compress_memory(request: Request):
+    """Compress old memories by removing duplicates."""
+    if not memory:
+        return JSONResponse({"error": "Memory not initialized"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    max_age = body.get("max_age_hours", 168)  # Default 1 week
+    results = memory.compress_all(max_age_hours=max_age)
+    return {"status": "compressed", "results": results}
+
+
+@app.get("/memory/confidence")
+async def memory_confidence(query: str, project: str = None):
+    """Search memory and return results with confidence scores and source info."""
+    if not memory:
+        return JSONResponse({"error": "Memory not initialized"}, status_code=503)
+    
+    proj = project or conv_projects.get("_global", "general")
+    results = memory.recall(query, project=proj, top_k=10)
+    
+    enriched = []
+    for r in results:
+        confidence = "high" if r["score"] > 0.5 else "medium" if r["score"] > 0.3 else "low"
+        enriched.append({
+            "text": r["text"][:200],
+            "score": r["score"],
+            "confidence": confidence,
+            "project": r.get("project", "general"),
+            "speaker": r.get("speaker", ""),
+            "entity_type": r.get("entity_type", ""),
+            "age_hours": round((time.time() - r.get("timestamp", time.time())) / 3600, 1),
+        })
+    
+    return {"query": query, "project": proj, "results": enriched}
 
 
 # ─── Catch-all proxy for other Ollama endpoints ───

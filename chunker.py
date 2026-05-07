@@ -24,7 +24,8 @@ _FUNC_RE = re.compile(r'^([ \t]*(?:async\s+)?def\s+\w+)', re.MULTILINE)
 _CLASS_RE = re.compile(r'^([ \t]*class\s+\w+)', re.MULTILINE)
 _BLOCK_START_RE = re.compile(r'^([ \t]*(?:async\s+)?(?:def|class)\s+\w+[^\n]*)', re.MULTILINE)
 
-MAX_CODE_LINES = 100
+MAX_CODE_LINES = 50
+CODE_OVERLAP_LINES = 5
 
 
 def _is_code(text: str) -> bool:
@@ -73,10 +74,12 @@ def _chunk_code_block(code: str, speaker: str, chunk_idx_start: int,
                 chunks.append(Chunk(text=sub, speaker=speaker, chunk_idx=idx, metadata=meta.copy()))
                 idx += 1
 
-    # Each function/class = 1 chunk
+    # Each function/class = 1 chunk (with overlap from previous)
     for i, start in enumerate(boundaries):
         end = boundaries[i + 1] if i + 1 < len(boundaries) else len(lines)
-        block = '\n'.join(lines[start:end]).rstrip()
+        # Add overlap: include last CODE_OVERLAP_LINES from previous block
+        overlap_start = max(0, start - CODE_OVERLAP_LINES) if i > 0 else start
+        block = '\n'.join(lines[overlap_start:end]).rstrip()
         if not block.strip():
             continue
 
@@ -95,10 +98,11 @@ def _chunk_code_block(code: str, speaker: str, chunk_idx_start: int,
 
 def _chunk_lines(lines: list[str], speaker: str, chunk_idx_start: int,
                  meta: dict) -> list[Chunk]:
-    """Chunk raw lines into groups of MAX_CODE_LINES."""
+    """Chunk raw lines into groups of MAX_CODE_LINES with overlap."""
     chunks = []
     idx = chunk_idx_start
-    for i in range(0, len(lines), MAX_CODE_LINES):
+    step = MAX_CODE_LINES - CODE_OVERLAP_LINES
+    for i in range(0, len(lines), step):
         block = '\n'.join(lines[i:i + MAX_CODE_LINES]).strip()
         if block:
             chunks.append(Chunk(text=block, speaker=speaker, chunk_idx=idx, metadata=meta.copy()))
