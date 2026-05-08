@@ -656,11 +656,37 @@ def inject_memories(messages: list[dict], query: str, conv_id: str,
     if not context_parts:
         return messages
 
-    full_context = "\n\n".join(context_parts)
+    # Build the system prompt — code context gets a strict instruction prefix
+    has_code = active_codebase and active_codebase in indexed_repos
+    code_ctx = None
+    mem_ctx = None
+    for part in context_parts:
+        if part.startswith("CODE TROUVÉ"):
+            code_ctx = part
+        else:
+            mem_ctx = part
+
+    injection_parts = []
+
+    if code_ctx:
+        injection_parts.append(
+            "Tu es un assistant expert en code. "
+            "RÈGLE ABSOLUE : Tu dois UNIQUEMENT répondre en utilisant le code ci-dessous "
+            "trouvé dans la codebase. Ne génère JAMAIS de code inventé. "
+            "Si la réponse n'est pas dans le contexte, dis "
+            "'Je n'ai pas trouvé cette information dans la codebase indexée.'\n\n"
+            + code_ctx
+        )
+
+    if mem_ctx:
+        injection_parts.append(mem_ctx)
+
+    full_context = "\n\n".join(injection_parts)
+
     result = list(messages)
     if result and result[0].get("role") == "system":
         result[0] = dict(result[0])
-        result[0]["content"] = result[0]["content"] + "\n\n" + full_context
+        result[0]["content"] = full_context + "\n\n" + result[0]["content"]
     else:
         result.insert(0, {"role": "system", "content": full_context})
 
@@ -670,18 +696,16 @@ def inject_memories(messages: list[dict], query: str, conv_id: str,
 def build_code_context(results: list[dict], codebase: str) -> str:
     """Format code search results for injection into the system prompt."""
     lines = [
-        f"=== CODE [{codebase.upper()}] ===",
-        "Voici les extraits de code pertinents trouvés dans la codebase :"
+        f"CODE TROUVÉ DANS LA CODEBASE [{codebase.upper()}] :",
     ]
     for i, r in enumerate(results, 1):
         loc = f"{r['file_path']}:{r['start_line']}-{r['end_line']}"
-        lines.append(f"\n--- [{i}] {r['name']} ({loc}) ---")
+        lines.append(f"\n--- [{i}] {r['name']} — Source : {loc} ---")
         code = r["text"]
-        if len(code) > 500:
-            code = code[:500] + "\n... (tronqué)"
+        if len(code) > 800:
+            code = code[:800] + "\n... (tronqué)"
         lines.append(code)
-    lines.append("=== FIN CODE ===")
-    lines.append("Cite toujours le fichier et les lignes quand tu fais référence au code.")
+    lines.append("\n--- FIN DU CODE TROUVÉ ---")
     return "\n".join(lines)
 
 
