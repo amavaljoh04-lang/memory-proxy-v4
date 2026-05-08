@@ -65,6 +65,48 @@ indexed_repos: dict[str, dict] = {}  # repo_name -> {collection, path, stats}
 active_codebase: str = ""  # currently active codebase for code search injection
 
 
+def _restore_indexed_repos(mem):
+    """Restore indexed repos state from Qdrant on startup.
+    
+    Scans for code_* collections and restores active_codebase from settings.
+    """
+    global indexed_repos, active_codebase
+    try:
+        collections = mem.client.get_collections().collections
+        for col in collections:
+            if col.name.startswith("code_"):
+                repo_name = col.name[5:]  # strip "code_" prefix
+                info = mem.client.get_collection(col.name)
+                indexed_repos[repo_name] = {
+                    "collection": col.name,
+                    "path": "",  # path not persisted, user can re-set with /switch
+                    "stats": {"chunks": info.points_count or 0},
+                }
+                log.info(f"Restored indexed repo: {repo_name} ({info.points_count} chunks)")
+
+        # Restore active codebase from settings
+        saved_codebase = mem.load_setting("active_codebase")
+        if saved_codebase and saved_codebase in indexed_repos:
+            active_codebase = saved_codebase
+            log.info(f"Restored active codebase: {active_codebase}")
+        elif indexed_repos:
+            # Default to largest repo (most chunks)
+            active_codebase = max(indexed_repos.keys(),
+                                  key=lambda k: indexed_repos[k]["stats"].get("chunks", 0))
+            log.info(f"Auto-selected active codebase: {active_codebase} ({indexed_repos[active_codebase]['stats'].get('chunks', 0)} chunks)")
+    except Exception as e:
+        log.error(f"Failed to restore indexed repos: {e}")
+
+
+def _persist_active_codebase():
+    """Save active_codebase to Qdrant settings for persistence."""
+    if memory:
+        try:
+            memory.save_setting("active_codebase", active_codebase)
+        except Exception as e:
+            log.error(f"Failed to persist active_codebase: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load encoder and memory on startup."""
@@ -86,6 +128,8 @@ async def lifespan(app: FastAPI):
             _global_manual = True
             log.info("Restored manual project lock — auto-detect disabled")
         log.info(f"Ready — {total} memories across {len(stats)} collections")
+        # Restore indexed repos from Qdrant (scan code_* collections)
+        _restore_indexed_repos(memory)
         # Init multi-backend support
         init_backends()
     except Exception as e:
@@ -316,6 +360,7 @@ def execute_slash_command(cmd: dict, model: str, conv_id: str) -> dict:
                 "stats": stats,
             }
             active_codebase = repo_name.lower()
+            _persist_active_codebase()
 
             text = (
                 f"**{repo_name}** indexé avec succès !\n\n"
@@ -346,8 +391,10 @@ def execute_slash_command(cmd: dict, model: str, conv_id: str) -> dict:
         name = cmd["name"]
         if name in indexed_repos:
             active_codebase = name
+            _persist_active_codebase()
             s = indexed_repos[name]["stats"]
-            text = f"Codebase active : **{name}** ({s['files']} fichiers, {s['chunks']} chunks)"
+            chunks = s.get("chunks", s.get("files", "?"))
+            text = f"Codebase active : **{name}** ({chunks} chunks)"
         else:
             available = ", ".join(indexed_repos.keys()) if indexed_repos else "aucune"
             text = f"Codebase `{name}` non trouvée. Disponibles : {available}"
@@ -585,13 +632,26 @@ def inject_memories(messages: list[dict], query: str, conv_id: str,
     if active_codebase and active_codebase in indexed_repos:
         try:
             collection = indexed_repos[active_codebase]["collection"]
+            log.info(f"Code search: query='{query[:60]}' collection={collection} codebase={active_codebase}")
             code_results = search_code(query, encoder, memory.client, collection, top_k=3)
-            if code_results and code_results[0]["score"] > 0.25:
-                code_ctx = build_code_context(code_results, active_codebase)
-                context_parts.append(code_ctx)
-                log.info(f"Injecting {len(code_results)} code results [codebase={active_codebase}] (top: {code_results[0]['score']:.3f})")
+            if code_results:
+                log.info(f"Code search results: {len(code_results)} hits, top score={code_results[0]['score']:.3f}")
+                if code_results[0]["score"] > 0.15:
+                    code_ctx = build_code_context(code_results, active_codebase)
+                    context_parts.append(code_ctx)
+                    log.info(f"Injecting {len(code_results)} code results [codebase={active_codebase}]")
+                else:
+                    log.info(f"Code results below threshold (top={code_results[0]['score']:.3f} < 0.15)")
+            else:
+                log.info("Code search returned no results")
         except Exception as e:
             log.error(f"Code search error: {e}")
+            import traceback; traceback.print_exc()
+    else:
+        if active_codebase:
+            log.debug(f"Code search skipped: active_codebase={active_codebase} not in indexed_repos={list(indexed_repos.keys())}")
+        else:
+            log.debug("Code search skipped: no active_codebase")
 
     if not context_parts:
         return messages
@@ -1354,6 +1414,7 @@ async def api_index_repo(request: Request):
         repo_name = os.path.basename(local_path).lower()
         indexed_repos[repo_name] = {"collection": stats["collection"], "path": local_path, "stats": stats}
         active_codebase = repo_name
+        _persist_active_codebase()
         return stats
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)

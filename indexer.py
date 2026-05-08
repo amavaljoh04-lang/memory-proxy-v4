@@ -449,14 +449,27 @@ def search_code(query: str, encoder, qdrant_client, collection: str,
                 top_k: int = 5) -> list[dict]:
     """Search indexed code with TriVox embeddings."""
     query_emb = encoder.encode(query)
-    hits = qdrant_client.search(
-        collection_name=collection,
-        query_vector=query_emb,
-        limit=top_k,
-        with_payload=True,
-    )
+
+    # Use query_points (qdrant-client >= 1.7) with fallback to search
+    try:
+        raw = qdrant_client.query_points(
+            collection_name=collection,
+            query=query_emb,
+            limit=top_k,
+            with_payload=True,
+            score_threshold=0.10,
+        ).points
+    except (ImportError, AttributeError, TypeError):
+        raw = qdrant_client.search(
+            collection_name=collection,
+            query_vector=query_emb,
+            limit=top_k,
+            with_payload=True,
+            score_threshold=0.10,
+        )
+
     results = []
-    for h in hits:
+    for h in raw:
         results.append({
             "text": h.payload.get("text", ""),
             "file_path": h.payload.get("file_path", ""),
