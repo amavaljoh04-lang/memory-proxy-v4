@@ -15,6 +15,7 @@ Architecture:
   Project isolation prevents NEXUS/AURORA/TriVox from mixing.
 """
 import json
+import os
 import re
 import time
 import uuid
@@ -33,6 +34,13 @@ from memory import MemoryStore
 from chunker import chunk_message
 from project_detector import detect_project, register_project, register_model_mapping, get_registered_projects, get_conv_name_stats
 from entity_extractor import extract_entities, extract_money_and_funder
+from indexer import index_repo, clone_repo, search_code, scan_repo, format_architecture
+from backends import (
+    init_backends, get_active_backend, get_active_backend_name,
+    set_active_backend, add_backend, list_backends, resolve_model,
+    forward_chat_ollama, forward_chat_openai,
+    parse_ollama_stream_line, parse_openai_stream_line,
+)
 
 # ─── Logging ───
 logging.basicConfig(
@@ -51,6 +59,10 @@ conv_projects: dict[str, str] = {}  # conv_id -> project
 # Track manually-set projects (via /projet X) — immune to auto-detection override
 manual_projects: set[str] = set()  # set of conv_ids with manual override
 _global_manual: bool = False  # True if /projet X was used (global sticky)
+
+# ─── Code indexing state ───
+indexed_repos: dict[str, dict] = {}  # repo_name -> {collection, path, stats}
+active_codebase: str = ""  # currently active codebase for code search injection
 
 
 @asynccontextmanager
@@ -74,6 +86,8 @@ async def lifespan(app: FastAPI):
             _global_manual = True
             log.info("Restored manual project lock — auto-detect disabled")
         log.info(f"Ready — {total} memories across {len(stats)} collections")
+        # Init multi-backend support
+        init_backends()
     except Exception as e:
         log.error(f"Failed to init encoder/memory: {e}")
         log.warning("Running in pass-through mode (no memory)")
@@ -135,6 +149,34 @@ def detect_slash_command(text: str, current_project: str = "general") -> dict | 
 
     if cmd in ("/aide", "/help"):
         return {"action": "help"}
+
+    if cmd in ("/index", "/indexer", "/indexe"):
+        if not arg:
+            return {"action": "index_status"}
+        return {"action": "index_repo", "path": arg.strip()}
+
+    if cmd in ("/switch", "/codebase", "/repo"):
+        if not arg:
+            return {"action": "list_codebases"}
+        return {"action": "switch_codebase", "name": arg.strip().lower()}
+
+    if cmd in ("/architecture", "/archi", "/arch"):
+        return {"action": "architecture"}
+
+    if cmd in ("/decision", "/décision"):
+        if not arg:
+            return {"action": "list_decisions"}
+        return {"action": "store_decision", "text": arg.strip()}
+
+    if cmd in ("/search", "/cherche", "/code"):
+        if not arg:
+            return None
+        return {"action": "search_code", "query": arg.strip()}
+
+    if cmd in ("/backend", "/llm", "/model"):
+        if not arg:
+            return {"action": "list_backends"}
+        return {"action": "switch_backend", "name": arg.strip().lower()}
 
     return None
 
@@ -221,15 +263,191 @@ def execute_slash_command(cmd: dict, model: str, conv_id: str) -> dict:
 
     elif action == "help":
         text = (
-            "**Commandes mémoire disponibles :**\n"
+            "**Commandes disponibles :**\n\n"
+            "**Mémoire :**\n"
             "  `/projet <nom>` → switcher sur un projet\n"
             "  `/oublie <nom>` → effacer la mémoire d'un projet\n"
             "  `/oublie tout` → reset complet de toute la mémoire\n"
             "  `/projets` → lister tous les projets en mémoire\n"
             "  `/mémoire` → voir les stats actuelles\n"
-            "  `/contexte` → preview du contexte injecté\n"
+            "  `/contexte` → preview du contexte injecté\n\n"
+            "**Codebase :**\n"
+            "  `/index /chemin/repo` → indexer un repo local\n"
+            "  `/index https://github.com/...` → cloner et indexer\n"
+            "  `/switch <nom>` → changer de codebase active\n"
+            "  `/architecture` → résumé de l'architecture du repo\n"
+            "  `/search <query>` → chercher dans le code\n\n"
+            "**Décisions :**\n"
+            "  `/decision <texte>` → stocker une décision architecturale\n"
+            "  `/decision` → lister les décisions\n\n"
+            "**Backend LLM :**\n"
+            "  `/backend` → voir les backends disponibles\n"
+            "  `/backend openai` → utiliser l'API OpenAI\n"
+            "  `/backend ollama` → revenir à Ollama (local)\n"
+            "  `/backend grok` → utiliser Grok (xAI)\n\n"
             "  `/aide` → cette aide"
         )
+
+    elif action == "index_repo":
+        global active_codebase
+        path = cmd["path"]
+        try:
+            if path.startswith(("http://", "https://", "git@")):
+                local_path = clone_repo(path)
+            else:
+                local_path = os.path.abspath(path)
+                if not os.path.isdir(local_path):
+                    text = f"Erreur : le dossier `{path}` n'existe pas."
+                    return {
+                        "model": model,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "message": {"role": "assistant", "content": text},
+                        "done": True, "done_reason": "slash_command",
+                    }
+
+            repo_name = os.path.basename(local_path)
+            stats = index_repo(
+                local_path, encoder, memory.client,
+                embed_dim=int(os.getenv("EMBED_DIM", "768")),
+            )
+            indexed_repos[repo_name.lower()] = {
+                "collection": stats["collection"],
+                "path": local_path,
+                "stats": stats,
+            }
+            active_codebase = repo_name.lower()
+
+            text = (
+                f"**{repo_name}** indexé avec succès !\n\n"
+                f"**{stats['files']}** fichiers | **{stats['lines']:,}** lignes | **{stats['chunks']}** chunks\n"
+                f"**{stats['classes']}** classes | **{stats['functions']}** fonctions\n"
+                f"Temps : {stats['elapsed_seconds']}s\n"
+                f"Langages : {', '.join(f'{k} ({v})' for k, v in sorted(stats['languages'].items(), key=lambda x: -x[1]))}\n\n"
+                f"Codebase active : **{repo_name}**\n"
+                f"Tu peux maintenant poser des questions sur le code !"
+            )
+        except Exception as e:
+            log.error(f"Index error: {e}")
+            import traceback; traceback.print_exc()
+            text = f"Erreur d'indexation : {e}"
+
+    elif action == "index_status":
+        if not indexed_repos:
+            text = "Aucune codebase indexée. Utilise `/index /chemin/repo` pour indexer."
+        else:
+            lines = ["**Codebases indexées :**"]
+            for name, info in indexed_repos.items():
+                s = info["stats"]
+                marker = " ← active" if name == active_codebase else ""
+                lines.append(f"  - **{name}** : {s['files']} fichiers, {s['chunks']} chunks{marker}")
+            text = "\n".join(lines)
+
+    elif action == "switch_codebase":
+        name = cmd["name"]
+        if name in indexed_repos:
+            active_codebase = name
+            s = indexed_repos[name]["stats"]
+            text = f"Codebase active : **{name}** ({s['files']} fichiers, {s['chunks']} chunks)"
+        else:
+            available = ", ".join(indexed_repos.keys()) if indexed_repos else "aucune"
+            text = f"Codebase `{name}` non trouvée. Disponibles : {available}"
+
+    elif action == "list_codebases":
+        if not indexed_repos:
+            text = "Aucune codebase indexée."
+        else:
+            lines = ["**Codebases disponibles :**"]
+            for name, info in indexed_repos.items():
+                s = info["stats"]
+                marker = " ← active" if name == active_codebase else ""
+                lines.append(f"  - **{name}** : {s['files']} fichiers{marker}")
+            text = "\n".join(lines)
+
+    elif action == "architecture":
+        if not active_codebase or active_codebase not in indexed_repos:
+            text = "Aucune codebase active. Utilise `/index /chemin/repo` d'abord."
+        else:
+            info = indexed_repos[active_codebase]
+            repo_path = info["path"]
+            _, arch = scan_repo(repo_path)
+            text = format_architecture(arch)
+
+    elif action == "store_decision":
+        decision_text = cmd["text"]
+        project = conv_projects.get(conv_id, conv_projects.get("_global", "general"))
+        if memory:
+            from chunker import Chunk
+            chunk = Chunk(
+                text=f"[DÉCISION ARCHITECTURALE] {decision_text}",
+                speaker="user",
+                chunk_idx=0,
+                metadata={"conv_id": conv_id, "type": "decision"}
+            )
+            memory.store([chunk], project=project)
+            text = f"Décision enregistrée dans le projet **{project.upper()}** :\n> {decision_text}"
+        else:
+            text = "Mémoire non initialisée."
+
+    elif action == "list_decisions":
+        project = conv_projects.get(conv_id, conv_projects.get("_global", "general"))
+        if memory:
+            results = memory.recall("décision architecturale", project=project, top_k=20)
+            decisions = [r for r in results if "[DÉCISION" in r.get("text", "")]
+            if decisions:
+                lines = [f"**Décisions du projet {project.upper()} :**"]
+                for d in decisions:
+                    text_clean = d["text"].replace("[DÉCISION ARCHITECTURALE] ", "")
+                    lines.append(f"  - {text_clean[:150]}")
+                text = "\n".join(lines)
+            else:
+                text = f"Aucune décision enregistrée pour **{project.upper()}**."
+        else:
+            text = "Mémoire non initialisée."
+
+    elif action == "search_code":
+        query = cmd["query"]
+        if not active_codebase or active_codebase not in indexed_repos:
+            text = "Aucune codebase active. Utilise `/index /chemin/repo` d'abord."
+        else:
+            collection = indexed_repos[active_codebase]["collection"]
+            results = search_code(query, encoder, memory.client, collection, top_k=5)
+            if results:
+                lines = [f"**Résultats dans {active_codebase} :**\n"]
+                for r in results:
+                    score_pct = int(r["score"] * 100)
+                    loc = f"{r['file_path']}:{r['start_line']}-{r['end_line']}"
+                    lines.append(f"**{r['name']}** ({loc}) — {score_pct}% match")
+                    # Show code snippet
+                    code = r["text"]
+                    if len(code) > 400:
+                        code = code[:400] + "\n..."
+                    lines.append(f"```{r['language']}\n{code}\n```\n")
+                text = "\n".join(lines)
+            else:
+                text = f"Aucun résultat pour `{query}` dans {active_codebase}."
+
+    elif action == "list_backends":
+        backends = list_backends()
+        active = get_active_backend_name()
+        lines = ["**Backends LLM disponibles :**"]
+        for name, info in backends.items():
+            marker = " ← actif" if info["active"] else ""
+            key_status = " (clé configurée)" if info["has_key"] else ""
+            models_str = f" — modèles: {', '.join(info['models'][:3])}" if info["models"] else ""
+            lines.append(f"  - **{name}** [{info['type']}]{key_status}{models_str}{marker}")
+        lines.append(f"\nUtilise `/backend <nom>` pour changer.")
+        text = "\n".join(lines)
+
+    elif action == "switch_backend":
+        name = cmd["name"]
+        if set_active_backend(name):
+            backend = get_active_backend()
+            text = f"Backend actif : **{backend.name}** ({name})\nType : {backend.backend_type}"
+            if backend.models:
+                text += f"\nModèles : {', '.join(backend.models[:5])}"
+        else:
+            available = ", ".join(list_backends().keys())
+            text = f"Backend `{name}` non trouvé. Disponibles : {available}"
 
     return {
         "model": model,
@@ -346,32 +564,65 @@ def build_memory_context(memories: list[dict], project: str) -> str:
 
 def inject_memories(messages: list[dict], query: str, conv_id: str,
                     project: str = "general") -> list[dict]:
-    """Inject relevant memories into the messages list."""
+    """Inject relevant memories + code context into the messages list."""
     if not memory or not query:
         return messages
 
+    context_parts = []
+
+    # 1. Memory recall
     try:
         memories = memory.recall(query, project=project,
                                  top_k=MAX_MEMORIES_INJECT,
                                  exclude_conv_id=conv_id)
+        if memories:
+            context_parts.append(build_memory_context(memories, project))
+            log.info(f"Injecting {len(memories)} memories [project={project}] (top: {memories[0]['score']:.3f})")
     except Exception as e:
         log.error(f"Recall error: {e}")
+
+    # 2. Code search (if a codebase is active)
+    if active_codebase and active_codebase in indexed_repos:
+        try:
+            collection = indexed_repos[active_codebase]["collection"]
+            code_results = search_code(query, encoder, memory.client, collection, top_k=3)
+            if code_results and code_results[0]["score"] > 0.25:
+                code_ctx = build_code_context(code_results, active_codebase)
+                context_parts.append(code_ctx)
+                log.info(f"Injecting {len(code_results)} code results [codebase={active_codebase}] (top: {code_results[0]['score']:.3f})")
+        except Exception as e:
+            log.error(f"Code search error: {e}")
+
+    if not context_parts:
         return messages
 
-    if not memories:
-        return messages
-
-    context = build_memory_context(memories, project)
-    log.info(f"Injecting {len(memories)} memories [project={project}] (top: {memories[0]['score']:.3f})")
-
+    full_context = "\n\n".join(context_parts)
     result = list(messages)
     if result and result[0].get("role") == "system":
         result[0] = dict(result[0])
-        result[0]["content"] = result[0]["content"] + "\n\n" + context
+        result[0]["content"] = result[0]["content"] + "\n\n" + full_context
     else:
-        result.insert(0, {"role": "system", "content": context})
+        result.insert(0, {"role": "system", "content": full_context})
 
     return result
+
+
+def build_code_context(results: list[dict], codebase: str) -> str:
+    """Format code search results for injection into the system prompt."""
+    lines = [
+        f"=== CODE [{codebase.upper()}] ===",
+        "Voici les extraits de code pertinents trouvés dans la codebase :"
+    ]
+    for i, r in enumerate(results, 1):
+        loc = f"{r['file_path']}:{r['start_line']}-{r['end_line']}"
+        lines.append(f"\n--- [{i}] {r['name']} ({loc}) ---")
+        code = r["text"]
+        if len(code) > 500:
+            code = code[:500] + "\n... (tronqué)"
+        lines.append(code)
+    lines.append("=== FIN CODE ===")
+    lines.append("Cite toujours le fichier et les lignes quand tu fais référence au code.")
+    return "\n".join(lines)
 
 
 # ─── Storage ───
@@ -425,7 +676,15 @@ def store_conversation(messages: list[dict], conv_id: str, project: str = "gener
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "memory-proxy-v4", "version": "4.1.0"}
+    active_backend = get_active_backend_name()
+    return {
+        "status": "ok",
+        "service": "memory-proxy-v4",
+        "version": "4.2.0",
+        "features": ["memory", "code_indexing", "multi_backend", "entity_extraction"],
+        "active_backend": active_backend,
+        "indexed_repos": list(indexed_repos.keys()),
+    }
 
 
 @app.get("/health")
@@ -434,7 +693,7 @@ async def health():
     total = sum(v for v in stats.values() if isinstance(v, int))
     return {
         "status": "ok",
-        "version": "4.1.0",
+        "version": "4.2.0",
         "memories_total": total,
         "collections": stats,
         "encoder": "loaded" if encoder else "none",
@@ -509,26 +768,67 @@ async def chat(request: Request):
 
 async def _stream_chat(body: dict, messages: list, user_query: str,
                        conv_id: str, project: str):
-    """Stream chat response from Ollama."""
+    """Stream chat response — routes to active backend."""
+    backend, model_name = resolve_model(body.get("model", ""))
     full_response = []
 
     async def generate():
         try:
-            async with http_client.stream(
-                "POST", f"{OLLAMA_URL}/api/chat",
-                json=body, timeout=300.0
-            ) as resp:
-                async for line in resp.aiter_lines():
-                    if line:
-                        yield line + "\n"
-                        try:
-                            data = json.loads(line)
-                            content = data.get("message", {}).get("content", "")
+            if backend.backend_type == "ollama":
+                # Direct Ollama streaming
+                async with http_client.stream(
+                    "POST", f"{backend.base_url}/api/chat",
+                    json=body, timeout=300.0
+                ) as resp:
+                    async for line in resp.aiter_lines():
+                        if line:
+                            yield line + "\n"
+                            content, _ = parse_ollama_stream_line(line)
                             if content:
                                 full_response.append(content)
-                        except json.JSONDecodeError:
-                            pass
+            else:
+                # OpenAI-compatible API streaming
+                openai_body = {
+                    "model": model_name or backend.default_model,
+                    "messages": body.get("messages", []),
+                    "stream": True,
+                }
+                if "options" in body:
+                    if "temperature" in body["options"]:
+                        openai_body["temperature"] = body["options"]["temperature"]
+                    if "num_predict" in body["options"]:
+                        openai_body["max_tokens"] = body["options"]["num_predict"]
+                headers = {"Content-Type": "application/json"}
+                if backend.api_key:
+                    headers["Authorization"] = f"Bearer {backend.api_key}"
+                url = f"{backend.base_url}/chat/completions"
+
+                async with http_client.stream(
+                    "POST", url, json=openai_body,
+                    headers=headers, timeout=300.0
+                ) as resp:
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        content, done = parse_openai_stream_line(line)
+                        if content:
+                            full_response.append(content)
+                            # Convert to Ollama format for Open-WebUI
+                            ollama_chunk = json.dumps({
+                                "model": model_name,
+                                "message": {"role": "assistant", "content": content},
+                                "done": False,
+                            })
+                            yield ollama_chunk + "\n"
+                        if done:
+                            yield json.dumps({
+                                "model": model_name,
+                                "message": {"role": "assistant", "content": ""},
+                                "done": True,
+                                "done_reason": "stop",
+                            }) + "\n"
         except Exception as e:
+            log.error(f"Stream error [{backend.name}]: {e}")
             yield json.dumps({"error": str(e)}) + "\n"
 
         # Store after streaming completes
@@ -542,18 +842,42 @@ async def _stream_chat(body: dict, messages: list, user_query: str,
 
 async def _sync_chat(body: dict, messages: list, user_query: str,
                      conv_id: str, project: str):
-    """Non-streaming chat."""
+    """Non-streaming chat — routes to active backend."""
+    backend, model_name = resolve_model(body.get("model", ""))
     try:
-        resp = await http_client.post(f"{OLLAMA_URL}/api/chat", json=body, timeout=300.0)
-        data = resp.json()
+        if backend.backend_type == "ollama":
+            resp = await http_client.post(f"{backend.base_url}/api/chat", json=body, timeout=300.0)
+            data = resp.json()
+            assistant_text = data.get("message", {}).get("content", "")
+        else:
+            openai_body = {
+                "model": model_name or backend.default_model,
+                "messages": body.get("messages", []),
+                "stream": False,
+            }
+            headers = {"Content-Type": "application/json"}
+            if backend.api_key:
+                headers["Authorization"] = f"Bearer {backend.api_key}"
+            resp = await http_client.post(
+                f"{backend.base_url}/chat/completions",
+                json=openai_body, headers=headers, timeout=300.0
+            )
+            openai_data = resp.json()
+            assistant_text = openai_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            # Convert to Ollama format
+            data = {
+                "model": model_name,
+                "message": {"role": "assistant", "content": assistant_text},
+                "done": True, "done_reason": "stop",
+            }
 
-        assistant_text = data.get("message", {}).get("content", "")
         if assistant_text and user_query and not is_meta_message(user_query):
             store_msgs = messages + [{"role": "assistant", "content": assistant_text}]
             store_conversation(store_msgs, conv_id, project)
 
         return JSONResponse(data)
     except Exception as e:
+        log.error(f"Sync chat error [{backend.name}]: {e}")
         return JSONResponse({"error": str(e)}, status_code=502)
 
 
@@ -971,6 +1295,116 @@ async def memory_confidence(query: str, project: str = None):
         })
     
     return {"query": query, "project": proj, "results": enriched}
+
+
+# ─── Backend API Endpoints ───
+
+@app.get("/backends")
+async def api_list_backends():
+    """List available LLM backends."""
+    return {"backends": list_backends(), "active": get_active_backend_name()}
+
+
+@app.post("/backends/switch")
+async def api_switch_backend(request: Request):
+    """Switch active backend."""
+    body = await request.json()
+    name = body.get("name", "")
+    if set_active_backend(name):
+        return {"status": "switched", "active": name}
+    return JSONResponse({"error": f"Backend '{name}' not found"}, status_code=404)
+
+
+@app.post("/backends/add")
+async def api_add_backend(request: Request):
+    """Add a custom backend at runtime."""
+    body = await request.json()
+    name = body.get("name", "")
+    base_url = body.get("base_url", "")
+    if not name or not base_url:
+        return JSONResponse({"error": "name and base_url required"}, status_code=400)
+    backend = add_backend(
+        name=name, base_url=base_url,
+        api_key=body.get("api_key", ""),
+        backend_type=body.get("type", "openai"),
+        models=body.get("models", []),
+    )
+    return {"status": "added", "backend": {"name": backend.name, "type": backend.backend_type}}
+
+
+# ─── Code Indexing API Endpoints ───
+
+@app.post("/code/index")
+async def api_index_repo(request: Request):
+    """Index a codebase via REST API."""
+    global active_codebase
+    if not encoder or not memory:
+        return JSONResponse({"error": "Encoder not initialized"}, status_code=503)
+    body = await request.json()
+    path = body.get("path", "")
+    if not path:
+        return JSONResponse({"error": "path required"}, status_code=400)
+    try:
+        if path.startswith(("http://", "https://", "git@")):
+            local_path = clone_repo(path)
+        else:
+            local_path = os.path.abspath(path)
+        stats = index_repo(local_path, encoder, memory.client,
+                           embed_dim=int(os.getenv("EMBED_DIM", "768")))
+        repo_name = os.path.basename(local_path).lower()
+        indexed_repos[repo_name] = {"collection": stats["collection"], "path": local_path, "stats": stats}
+        active_codebase = repo_name
+        return stats
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/code/search")
+async def api_search_code(request: Request):
+    """Search indexed code via REST API."""
+    if not encoder or not memory:
+        return JSONResponse({"error": "Encoder not initialized"}, status_code=503)
+    body = await request.json()
+    query = body.get("query", "")
+    codebase = body.get("codebase", active_codebase)
+    top_k = body.get("top_k", 5)
+    if not query:
+        return JSONResponse({"error": "query required"}, status_code=400)
+    if not codebase or codebase not in indexed_repos:
+        return JSONResponse({"error": f"Codebase '{codebase}' not found"}, status_code=404)
+    collection = indexed_repos[codebase]["collection"]
+    results = search_code(query, encoder, memory.client, collection, top_k=top_k)
+    return {"query": query, "codebase": codebase, "results": results}
+
+
+@app.get("/code/repos")
+async def api_list_repos():
+    """List all indexed repos."""
+    return {
+        "repos": {name: info["stats"] for name, info in indexed_repos.items()},
+        "active": active_codebase,
+    }
+
+
+@app.get("/code/architecture")
+async def api_architecture(codebase: str = None):
+    """Get architecture of an indexed repo."""
+    name = codebase or active_codebase
+    if not name or name not in indexed_repos:
+        return JSONResponse({"error": "No active codebase"}, status_code=404)
+    repo_path = indexed_repos[name]["path"]
+    _, arch = scan_repo(repo_path)
+    return {
+        "repo": arch.repo_name,
+        "files": arch.total_files,
+        "lines": arch.total_lines,
+        "languages": arch.languages,
+        "classes": [(n, f, l) for n, f, l in arch.classes[:50]],
+        "functions": [(n, f, l) for n, f, l in arch.functions[:50]],
+        "imports": dict(sorted(arch.imports.items(), key=lambda x: -x[1])[:30]),
+        "entry_points": arch.entry_points,
+        "config_files": arch.config_files,
+    }
 
 
 # ─── Catch-all proxy for other Ollama endpoints ───
