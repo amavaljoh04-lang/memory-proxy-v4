@@ -656,8 +656,7 @@ def inject_memories(messages: list[dict], query: str, conv_id: str,
     if not context_parts:
         return messages
 
-    # Build the system prompt — code context gets a strict instruction prefix
-    has_code = active_codebase and active_codebase in indexed_repos
+    # Separate code context from memory context
     code_ctx = None
     mem_ctx = None
     for part in context_parts:
@@ -666,29 +665,35 @@ def inject_memories(messages: list[dict], query: str, conv_id: str,
         else:
             mem_ctx = part
 
-    injection_parts = []
-
-    if code_ctx:
-        injection_parts.append(
-            "Tu es un assistant expert en code. "
-            "RÈGLE ABSOLUE : Tu dois UNIQUEMENT répondre en utilisant le code ci-dessous "
-            "trouvé dans la codebase. Ne génère JAMAIS de code inventé. "
-            "Si la réponse n'est pas dans le contexte, dis "
-            "'Je n'ai pas trouvé cette information dans la codebase indexée.'\n\n"
-            + code_ctx
-        )
-
-    if mem_ctx:
-        injection_parts.append(mem_ctx)
-
-    full_context = "\n\n".join(injection_parts)
-
     result = list(messages)
-    if result and result[0].get("role") == "system":
-        result[0] = dict(result[0])
-        result[0]["content"] = full_context + "\n\n" + result[0]["content"]
-    else:
-        result.insert(0, {"role": "system", "content": full_context})
+
+    # Memory context → inject in system prompt (works well there)
+    if mem_ctx:
+        if result and result[0].get("role") == "system":
+            result[0] = dict(result[0])
+            result[0]["content"] = result[0]["content"] + "\n\n" + mem_ctx
+        else:
+            result.insert(0, {"role": "system", "content": mem_ctx})
+
+    # Code context → inject directly in user message (technique 2)
+    # Small models respect user message content more than system prompts
+    if code_ctx:
+        # Find the last user message and wrap it with code context
+        for i in range(len(result) - 1, -1, -1):
+            if result[i].get("role") == "user":
+                original_query = result[i]["content"]
+                result[i] = dict(result[i])
+                result[i]["content"] = (
+                    f"Voici le code pertinent trouvé dans la codebase :\n\n"
+                    f"{code_ctx}\n\n"
+                    f"INSTRUCTIONS :\n"
+                    f"1. Utilise le code ci-dessus pour répondre. Cite le fichier source et les lignes.\n"
+                    f"2. Si tu montres du code, montre le VRAI code trouvé ci-dessus, pas du code inventé.\n"
+                    f"3. Tu peux expliquer et analyser le code trouvé.\n"
+                    f"4. Si aucun code ci-dessus ne correspond à la question, dis-le.\n\n"
+                    f"Question : {original_query}"
+                )
+                break
 
     return result
 
